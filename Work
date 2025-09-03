@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import json
+import os
+import time
+import math
+from collections import defaultdict
+from typing import Dict, List, Optional
+
+class SimpleCorporateOptionsAnalyzer:
+    def __init__(self):
+        # API Keys - Pre-configured with your actual keys
+        self.api_keys = {
+            'alpha_vantage': '88V3TVAZZ6EBBBTP',
+            'finnhub': 'd2fpot9r01qkv5near9gd2fpot9r01qkv5neara0'
+        }
+        
+        # Rate limiting to respect API limits
+        self.last_request_time = {}
+        self.min_interval = {
+            'alpha_vantage': 15,  # Increased for reliability
+            'finnhub': 1.2,       # 60 requests per minute max
+        }
+        
+        # File management
+        self.results_file = "options_results.json"
+        self.watchlist_file = "watchlist.json"
+        
+        # Simple session without complex retry logic
+        self.session = requests.Session()
+        self.session.verify = False
+        
+        # Disable SSL warnings
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except:
+            pass
+        
+        print("🚀 Simple Corporate-Friendly Advanced Options Analyzer v2.1")
+        print("📡 Using Alpha Vantage + Finnhub APIs with Yahoo Finance fallback")
+        self.load_watchlist()
+    
+    def _rate_limit(self, api_name: str):
+        """Implement rate limiting for APIs"""
+        if api_name in self.last_request_time:
+            elapsed = time.time() - self.last_request_time[api_name]
+            sleep_time = self.min_interval[api_name] - elapsed
+            if sleep_time > 0:
+                print(f"⏱️  Rate limiting: waiting {sleep_time:.1f} seconds for {api_name}")
+                time.sleep(sleep_time)
+        
+        self.last_request_time[api_name] = time.time()
+    
+    def make_request(self, url, params=None, timeout=30, max_retries=3):
+        """Make HTTP request with simple error handling"""
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, params=params, timeout=timeout)
+                response.raise_for_status()
+                return response.json()
+                
+            except requests.exceptions.ConnectionError as e:
+                print(f"🌐 Connection error (attempt {attempt + 1}): Network issue")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    print(f"⏱️  Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                    
+            except requests.exceptions.Timeout:
+                print(f"⏱️  Timeout (attempt {attempt + 1})")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+                    
+            except Exception as e:
+                print(f"❌ Request error (attempt {attempt + 1}): {str(e)[:50]}...")
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                    continue
+        
+        return None
+    
+    def get_stock_data_alpha_vantage(self, symbol: str) -> Optional[Dict]:
+        """Get comprehensive stock data from Alpha Vantage"""
+        try:
+            self._rate_limit('alpha_vantage')
+            
+            url = "https://www.alphavantage.co/query"
+            params = {
+                'function': 'GLOBAL_QUOTE',
+                'symbol': symbol,
+                'apikey': self.api_keys['alpha_vantage']
+            }
+            
+            data = self.make_request(url, params, timeout=20)
+            
+            if not data:
+                return None
+                
+            if 'Global Quote' in data:
+                quote = data['Global Quote']
+                
+                if quote and quote.get('05. price', '0') != '0.0000':
+                    return {
+                        'symbol': symbol,
+                        'current_price': float(quote['05. price']),
+                        'change': float(quote['09. change']),
+                        'change_percent': float(quote['10. change percent'].strip('%')),
+                        'volume': int(quote['06. volume']),
+                        'high': float(quote['03. high']),
+                        'low': float(quote['04. low']),
+                        'open': float(quote['02. open']),
+                        'prev_close': float(quote['08. previous close']),
+                        'source': 'Alpha Vantage'
+                    }
+            elif 'Error Message' in data:
+                print(f"⚠️  Alpha Vantage error: {data['Error Message']}")
+            elif 'Note' in data:
+                print(f"⚠️  Alpha Vantage rate limit: {data['Note']}")
+                
+        except Exception as e:
+            print(f"❌ Alpha Vantage request failed: {e}")
+        
+        return None
+    
+    def get_stock_data_finnhub(self, symbol: str) -> Optional[Dict]:
+        """Get stock data from Finnhub as backup"""
+        try:
+            self._rate_limit('finnhub')
+            
+            url = "https://finnhub.io/api/v1/quote"
+            params = {
+                'symbol': symbol,
+                'token': self.api_keys['finnhub']
+            }
+            
+            data = self.make_request(url, params, timeout=15)
+            
+            if data and 'c' in data and data['c'] is not None:
+                current_price = data['c']
+                prev_close = data['pc']
+                change = current_price - prev_close
+                change_percent = (change / prev_close) * 100 if prev_close else 0
+                
+                return {
+                    'symbol': symbol,
+                    'current_price': current_price,
+                    'change': change,
+                    'change_percent': change_percent,
+                    'high': data['h'],
+                    'low': data['l'],
+                    'open': data['o'],
+                    'prev_close': prev_close,
+                    'source': 'Finnhub'
+                }
+                
+        except Exception as e:
+            print(f"❌ Finnhub request failed: {e}")
+        
+        return None
+    
+    def get_yfinance_data_fallback(self, symbol: str) -> Optional[Dict]:
+        """Yahoo Finance fallback for comprehensive options analysis"""
+        try:
+            print(f"🔄 Attempting Yahoo Finance fallback for {symbol}...")
+            
+            # SSL bypass for corporate networks
+            import ssl
+            import os
+            ssl._create_default_https_context = ssl._create_unverified_context
+            os.environ['PYTHONHTTPSVERIFY'] = '0'
+            
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            
+            # Get basic stock data
+            hist = ticker.history(period="10d")
+            if hist.empty:
+                return None
+            
+            current_price = hist['Close'].iloc[-1]
+            prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+            change = current_price - prev_close
+            change_percent = (change / prev_close) * 100
+            
+            return {
+                'symbol': symbol,
+                'current_price': current_price,
+                'change': change,
+                'change_percent': change_percent,
+                'high': hist['High'].iloc[-1],
+                'low': hist['Low'].iloc[-1],
+                'open': hist['Open'].iloc[-1],
+                'volume': hist['Volume'].iloc[-1],
+                'prev_close': prev_close,
+                'source': 'Yahoo Finance (Fallback)',
+                'ticker_obj': ticker,
+                'hist_data': hist
+            }
+            
+        except Exception as e:
+            print(f"❌ Yahoo Finance fallback failed: {e}")
+        
+        return None
+    
+    def get_company_info_finnhub(self, symbol: str) -> Optional[Dict]:
+        """Get company profile from Finnhub"""
+        try:
+            self._rate_limit('finnhub')
+            
+            url = "https://finnhub.io/api/v1/stock/profile2"
+            params = {
+                'symbol': symbol,
+                'token': self.api_keys['finnhub']
+            }
+            
+            data = self.make_request(url, params, timeout=15)
+            
+            if data and 'name' in data:
+                return {
+                    'company_name': data.get('name', symbol),
+                    'sector': data.get('finnhubIndustry', 'Unknown'),
+                    'country': data.get('country', 'Unknown'),
+                    'market_cap': data.get('marketCapitalization', 0) * 1000000,
+                    'website': data.get('weburl', ''),
+                    'source': 'Finnhub'
+                }
+                
+        except Exception as e:
+            print(f"❌ Finnhub company info failed: {e}")
+        
+        return None
+    
+    def calculate_realized_volatility(self, df: pd.DataFrame, days: int = 10) -> float:
+        """Calculate realized volatility from historical data"""
+        try:
+            if df is None or len(df) < days:
+                return 0
+            
+            recent_data = df.tail(days).copy()
+            recent_data['Returns'] = recent_data['Close'].pct_change()
+            daily_vol = recent_data['Returns'].std()
+            annualized_vol = daily_vol * math.sqrt(252) * 100
+            
+            return annualized_vol
+            
+        except Exception as e:
+            print(f"❌ Volatility calculation failed: {e}")
+            return 0
+    
+    # OPTIONS ANALYSIS METHODS
+    def get_top_expirations(self, ticker, max_expirations=3):
+        """Find the top expirations by total volume and open interest"""
+        expiration_metrics = []
+        
+        print(f"  🔍 Scanning expirations for highest activity...")
+        
+        for exp_date in ticker.options[:10]:
+            try:
+                option_chain = ticker.option_chain(exp_date)
+                
+                if not option_chain.calls.empty and not option_chain.puts.empty:
+                    total_volume = (option_chain.calls['volume'].fillna(0).sum() + 
+                                  option_chain.puts['volume'].fillna(0).sum())
+                    total_oi = (option_chain.calls['openInterest'].fillna(0).sum() + 
+                              option_chain.puts['openInterest'].fillna(0).sum())
+                    
+                    exp_datetime = pd.to_datetime(exp_date)
+                    days_to_exp = (exp_datetime.date() - datetime.now().date()).days
+                    
+                    time_weight = 1.5 if days_to_exp <= 7 else 1.2 if days_to_exp <= 30 else 1.0
+                    activity_score = (total_volume * 2 + total_oi) * time_weight
+                    
+                    expiration_metrics.append({
+                        'date': exp_date,
+                        'volume': total_volume,
+                        'oi': total_oi,
+                        'days_to_exp': days_to_exp,
+                        'activity_score': activity_score
+                    })
+                
+                time.sleep(0.1)
+                
+            except Exception as e:
+                continue
+        
+        expiration_metrics.sort(key=lambda x: x['activity_score'], reverse=True)
+        top_expirations = expiration_metrics[:max_expirations]
+        
+        if top_expirations:
+            print(f"  📊 Top {len(top_expirations)} most active expirations identified")
+            for i, exp in enumerate(top_expirations, 1):
+                print(f"    {i}. {exp['date']} ({exp['days_to_exp']}d): {exp['volume']:,.0f} vol, {exp['oi']:,.0f} OI")
+        
+        return [exp['date'] for exp in top_expirations]
+    
+    def calculate_max_pain(self, option_chain, current_price):
+        """Calculate max pain point where most options expire worthless"""
+        try:
+            strikes = set(option_chain.calls['strike'].tolist() + option_chain.puts['strike'].tolist())
+            pain_values = {}
+            
+            for strike in strikes:
+                total_pain = 0
+                
+                for _, call in option_chain.calls.iterrows():
+                    if strike > call['strike']:
+                        total_pain += call['openInterest'] * (strike - call['strike'])
+                
+                for _, put in option_chain.puts.iterrows():
+                    if strike < put['strike']:
+                        total_pain += put['openInterest'] * (put['strike'] - strike)
+                
+                pain_values[strike] = total_pain
+            
+            if pain_values:
+                max_pain_strike = min(pain_values.keys(), key=lambda k: pain_values[k])
+                return max_pain_strike, pain_values[max_pain_strike]
+            return None, None
+        
+        except Exception as e:
+            return None, None
+    
+    def find_unusual_activity(self, option_chain):
+        """Identify unusual options activity based on volume vs OI"""
+        unusual_calls = []
+        unusual_puts = []
+        
+        try:
+            for _, call in option_chain.calls.iterrows():
+                if call['volume'] and call['openInterest']:
+                    ratio = call['volume'] / max(call['openInterest'], 1)
+                    if call['volume'] > 500 and ratio > 3:
+                        unusual_calls.append({
+                            'strike': call['strike'],
+                            'volume': int(call['volume']),
+                            'oi': int(call['openInterest']),
+                            'ratio': round(ratio, 1)
+                        })
+            
+            for _, put in option_chain.puts.iterrows():
+                if put['volume'] and put['openInterest']:
+                    ratio = put['volume'] / max(put['openInterest'], 1)
+                    if put['volume'] > 500 and ratio > 3:
+                        unusual_puts.append({
+                            'strike': put['strike'],
+                            'volume': int(put['volume']),
+                            'oi': int(put['openInterest']),
+                            'ratio': round(ratio, 1)
+                        })
+        
+        except Exception as e:
+            pass
+        
+        unusual_calls.sort(key=lambda x: x['volume'], reverse=True)
+        unusual_puts.sort(key=lambda x: x['volume'], reverse=True)
+        
+        return unusual_calls[:3], unusual_puts[:3]
+    
+    def analyze_symbol(self, symbol: str, save_result: bool = True, detailed: bool = True) -> Optional[Dict]:
+        """Enhanced comprehensive analysis using multiple APIs and options analysis"""
+        print(f"\n🔍 Analyzing {symbol.upper()}...")
+        print("=" * 50)
+        
+        results = {
+            'symbol': symbol.upper(),
+            'timestamp': datetime.now(),
+            'data_sources': [],
+            'errors': []
+        }
+        
+        # Strategy 1: Try Alpha Vantage first
+        stock_data = self.get_stock_data_alpha_vantage(symbol)
+        if stock_data:
+            results.update(stock_data)
+            results['data_sources'].append('Alpha Vantage')
+        else:
+            # Strategy 2: Fall back to Finnhub
+            print("🔄 Alpha Vantage failed, trying Finnhub...")
+            stock_data = self.get_stock_data_finnhub(symbol)
+            if stock_data:
+                results.update(stock_data)
+                results['data_sources'].append('Finnhub')
+        
+        # Strategy 3: If both fail, try Yahoo Finance for comprehensive analysis
+        yf_data = None
+        if not stock_data:
+            print("🔄 Trying Yahoo Finance for comprehensive data...")
+            yf_data = self.get_yfinance_data_fallback(symbol)
+            if yf_data:
+                results.update(yf_data)
+                results['data_sources'].append('Yahoo Finance')
+                stock_data = yf_data
+        
+        if not stock_data:
+            print(f"❌ No data available from any source for {symbol}")
+            return None
+        
+        # Display basic stock info
+        print(f"💰 Current Price: ${stock_data['current_price']:.2f}")
+        print(f"📈 Change: {stock_data['change']:+.2f} ({stock_data['change_percent']:+.2f}%)")
+        
+        if 'volume' in stock_data:
+            print(f"📊 Volume: {stock_data['volume']:,}")
+        if 'high' in stock_data and 'low' in stock_data:
+            print(f"📊 Day Range: ${stock_data['low']:.2f} - ${stock_data['high']:.2f}")
+        
+        print(f"📡 Price Source: {stock_data['source']}")
+        
+        # Get company information
+        if detailed:
+            company_info = self.get_company_info_finnhub(symbol)
+            if company_info:
+                results['company_info'] = company_info
+                results['data_sources'].append('Finnhub Profile')
+                
+                print(f"\n🏢 Company: {company_info['company_name']}")
+                print(f"🏭 Sector: {company_info['sector']}")
+                if company_info['market_cap'] > 0:
+                    market_cap_b = company_info['market_cap'] / 1e9
+                    print(f"💼 Market Cap: ${market_cap_b:.1f}B")
+        
+        # Calculate volatility from historical data
+        realized_vol = 0
+        if 'hist_data' in stock_data:
+            hist_data = stock_data['hist_data']
+            realized_vol = self.calculate_realized_volatility(hist_data, 10)
+            if realized_vol > 0:
+                print(f"📈 10-day Realized Volatility: {realized_vol:.1f}%")
+                
+                # Volatility assessment
+                if realized_vol > 50:
+                    vol_assessment = "🔴 EXTREMELY HIGH"
+                elif realized_vol > 35:
+                    vol_assessment = "🟠 HIGH"
+                elif realized_vol > 25:
+                    vol_assessment = "🟡 MODERATE"
+                elif realized_vol > 15:
+                    vol_assessment = "🟢 LOW"
+                else:
+                    vol_assessment = "🔵 VERY LOW"
+                
+                print(f"📊 Volatility Assessment: {vol_assessment}")
+        
+        # COMPREHENSIVE OPTIONS ANALYSIS (if Yahoo Finance data available)
+        if yf_data and 'ticker_obj' in yf_data:
+            ticker = yf_data['ticker_obj']
+            current_price = stock_data['current_price']
+            
+            print(f"\n🎯 COMPREHENSIVE OPTIONS ANALYSIS:")
+            print("=" * 50)
+            
+            # Check options availability
+            if hasattr(ticker, 'options') and ticker.options:
+                print(f"📅 Available expirations: {len(ticker.options)}")
+                
+                # Get top most active expirations
+                top_expirations = self.get_top_expirations(ticker, 3)
+                
+                if top_expirations:
+                    print(f"📅 Analyzing top {len(top_expirations)} most active expirations:")
+                    
+                    # Initialize analysis variables
+                    total_call_volume = 0
+                    total_put_volume = 0
+                    total_call_oi = 0
+                    total_put_oi = 0
+                    all_unusual_calls = []
+                    all_unusual_puts = []
+                    max_pain_price = None
+                    weighted_iv = 0
+                    total_iv_weight = 0
+                    
+                    # Analyze the most active expirations
+                    for i, exp_date in enumerate(top_expirations):
+                        try:
+                            exp_datetime = pd.to_datetime(exp_date)
+                            days_to_exp = (exp_datetime.date() - datetime.now().date()).days
+                            
+                            print(f"  📊 Processing {exp_date} ({i+1}/{len(top_expirations)}) - {days_to_exp} days...")
+                            option_chain = ticker.option_chain(exp_date)
+                            
+                            if not option_chain.calls.empty and not option_chain.puts.empty:
+                                call_vol = option_chain.calls['volume'].fillna(0).sum()
+                                put_vol = option_chain.puts['volume'].fillna(0).sum()
+                                call_oi = option_chain.calls['openInterest'].fillna(0).sum()
+                                put_oi = option_chain.puts['openInterest'].fillna(0).sum()
+                                
+                                total_call_volume += call_vol
+                                total_put_volume += put_vol
+                                total_call_oi += call_oi
+                                total_put_oi += put_oi
+                                
+                                # Calculate average IV
+                                call_iv = option_chain.calls['impliedVolatility'].fillna(0).mean() * 100
+                                put_iv = option_chain.puts['impliedVolatility'].fillna(0).mean() * 100
+                                avg_iv = (call_iv + put_iv) / 2
+                                
+                                # Weight by total volume for overall IV calculation
+                                total_vol = call_vol + put_vol
+                                if total_vol > 0:
+                                    weighted_iv += avg_iv * total_vol
+                                    total_iv_weight += total_vol
+                                
+                                # Display with time context
+                                exp_type = ""
+                                if days_to_exp <= 7:
+                                    exp_type = " [WEEKLY]"
+                                elif days_to_exp <= 30:
+                                    exp_type = " [MONTHLY]"
+                                
+                                print(f"    Calls: {call_vol:,.0f} vol, {call_oi:,.0f} OI, IV: {call_iv:.1f}%{exp_type}")
+                                print(f"    Puts:  {put_vol:,.0f} vol, {put_oi:,.0f} OI, IV: {put_iv:.1f}%")
+                                
+                                # Enhanced analysis for first expiration
+                                if detailed and i == 0:
+                                    print(f"    📈 Enhanced analysis for top expiration:")
+                                    
+                                    # Max pain calculation
+                                    max_pain, pain_value = self.calculate_max_pain(option_chain, current_price)
+                                    if max_pain:
+                                        max_pain_price = max_pain
+                                        distance = abs(current_price - max_pain)
+                                        direction = "above" if current_price > max_pain else "below"
+                                        print(f"      🎯 Max Pain: ${max_pain:.2f} (${distance:.2f} {direction} current)")
+                                    
+                                    # Unusual activity detection
+                                    unusual_calls, unusual_puts = self.find_unusual_activity(option_chain)
+                                    if unusual_calls:
+                                        print(f"      🚨 Unusual Call Activity: {len(unusual_calls)} strikes")
+                                        for uc in unusual_calls[:2]:
+                                            print(f"        ${uc['strike']:.0f} - {uc['volume']:,} vol ({uc['ratio']:.1f}x OI)")
+                                    
+                                    if unusual_puts:
+                                        print(f"      🚨 Unusual Put Activity: {len(unusual_puts)} strikes")
+                                        for up in unusual_puts[:2]:
+                                            print(f"        ${up['strike']:.0f} - {up['volume']:,} vol ({up['ratio']:.1f}x OI)")
+                                    
+                                    all_unusual_calls.extend(unusual_calls)
+                                    all_unusual_puts.extend(unusual_puts)
+                        
+                        except Exception as e:
+                            print(f"    ⚠️  Error processing {exp_date}: {e}")
+                            continue
+                    
+                    # Calculate final options metrics
+                    if total_call_volume > 0 or total_put_volume > 0:
+                        pcr_volume = total_put_volume / total_call_volume if total_call_volume > 0 else 0
+                        pcr_oi = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+                        avg_iv = weighted_iv / total_iv_weight if total_iv_weight > 0 else 0
+                        iv_rv_ratio = avg_iv / realized_vol if realized_vol > 0 else None
+                        
+                        # Store options metrics
+                        results.update({
+                            'pcr_volume': pcr_volume,
+                            'pcr_oi': pcr_oi,
+                            'implied_vol': avg_iv,
+                            'iv_rv_ratio': iv_rv_ratio,
+                            'total_call_volume': total_call_volume,
+                            'total_put_volume': total_put_volume,
+                            'total_call_oi': total_call_oi,
+                            'total_put_oi': total_put_oi,
+                            'unusual_call_count': len(all_unusual_calls),
+                            'unusual_put_count': len(all_unusual_puts),
+                            'max_pain': max_pain_price,
+                            'realized_volatility': realized_vol
+                        })
+                        
+                        # Enhanced sentiment analysis
+                        sentiment_score = 0
+                        sentiment_factors = []
+                        
+                        # Volume-based sentiment (primary factor)
+                        if pcr_volume > 1.5:
+                            sentiment_score -= 3
+                            sentiment_factors.append("Very high put volume")
+                        elif pcr_volume > 1.2:
+                            sentiment_score -= 2
+                            sentiment_factors.append("High put volume")
+                        elif pcr_volume < 0.6:
+                            sentiment_score += 3
+                            sentiment_factors.append("Very high call volume")
+                        elif pcr_volume < 0.8:
+                            sentiment_score += 2
+                            sentiment_factors.append("High call volume")
+                        
+                        # Price momentum
+                        change_pct = stock_data['change_percent']
+                        if change_pct > 3:
+                            sentiment_score += 2
+                            sentiment_factors.append("Strong positive momentum")
+                        elif change_pct > 1:
+                            sentiment_score += 1
+                            sentiment_factors.append("Positive momentum")
+                        elif change_pct < -3:
+                            sentiment_score -= 2
+                            sentiment_factors.append("Strong negative momentum")
+                        elif change_pct < -1:
+                            sentiment_score -= 1
+                            sentiment_factors.append("Negative momentum")
+                        
+                        # Unusual activity
+                        if len(all_unusual_calls) > len(all_unusual_puts):
+                            sentiment_score += 1
+                            sentiment_factors.append("Unusual call buying")
+                        elif len(all_unusual_puts) > len(all_unusual_calls):
+                            sentiment_score -= 1
+                            sentiment_factors.append("Unusual put buying")
+                        
+                        # IV premium/discount
+                        if iv_rv_ratio:
+                            if iv_rv_ratio > 1.5:
+                                sentiment_factors.append("High IV premium")
+                            elif iv_rv_ratio < 0.8:
+                                sentiment_factors.append("Low IV discount")
+                        
+                        # Final sentiment
+                        if sentiment_score >= 4:
+                            sentiment = "🟢 EXTREMELY BULLISH"
+                        elif sentiment_score >= 2:
+                            sentiment = "🟢 BULLISH"
+                        elif sentiment_score >= 1:
+                            sentiment = "🟢 SLIGHTLY BULLISH"
+                        elif sentiment_score <= -4:
+                            sentiment = "🔴 EXTREMELY BEARISH"
+                        elif sentiment_score <= -2:
+                            sentiment = "🔴 BEARISH"
+                        elif sentiment_score <= -1:
+                            sentiment = "🔴 SLIGHTLY BEARISH"
+                        else:
+                            sentiment = "🟡 NEUTRAL"
+                        
+                        results['sentiment'] = sentiment
+                        results['sentiment_score'] = sentiment_score
+                        results['sentiment_factors'] = sentiment_factors
+                        
+                        # Display comprehensive results
+                        print(f"\n📊 COMPREHENSIVE ANALYSIS:")
+                        print(f"=" * 50)
+                        print(f"Symbol: {symbol.upper()}")
+                        print(f"Current Price: ${stock_data['current_price']:.2f} ({stock_data['change_percent']:+.2f}%)")
+                        if realized_vol > 0:
+                            print(f"Realized Vol (10d): {realized_vol:.1f}%")
+                        if avg_iv > 0:
+                            print(f"Implied Vol (avg): {avg_iv:.1f}%")
+                            if iv_rv_ratio:
+                                print(f"IV/RV Ratio: {iv_rv_ratio:.2f}x")
+                        
+                        print(f"\n📊 VOLUME & POSITIONING:")
+                        print(f"  Call Volume: {total_call_volume:,.0f} | Put Volume: {total_put_volume:,.0f}")
+                        print(f"  Call OI: {total_call_oi:,.0f} | Put OI: {total_put_oi:,.0f}")
+                        print(f"  P/C Volume: {pcr_volume:.3f} | P/C OI: {pcr_oi:.3f}")
+                        if max_pain_price:
+                            print(f"  Max Pain: ${max_pain_price:.2f}")
+                        
+                        print(f"\n🎯 SENTIMENT: {sentiment} (Score: {sentiment_score})")
+                        if sentiment_factors:
+                            print(f"   Key Factors: {', '.join(sentiment_factors[:3])}")
+                        
+                        # Special alerts
+                        alerts = []
+                        
+                        if len(all_unusual_calls) + len(all_unusual_puts) >= 3:
+                            alerts.append(f"🚨 HIGH UNUSUAL ACTIVITY - {len(all_unusual_calls)} calls, {len(all_unusual_puts)} puts")
+                        
+                        if pcr_volume > 2.0:
+                            alerts.append(f"🔴 EXTREME PUT VOLUME - P/C ratio
